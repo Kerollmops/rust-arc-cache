@@ -1,11 +1,9 @@
-use xlru_cache::LruCache;
+use xlru_cache::{LruCache, IntoIter, Iter};
 use std::borrow::Borrow;
 use std::hash::Hash;
+use std::iter;
 
-pub struct ArcCache<K, V>
-where
-    K: Eq + Hash,
-{
+pub struct ArcCache<K, V> {
     recent_set: LruCache<K, V>,
     recent_evicted: LruCache<K, ()>,
     frequent_set: LruCache<K, V>,
@@ -19,24 +17,21 @@ where
 
 impl<K, V> ArcCache<K, V>
 where
-    K: Eq + Hash,
+    K: Eq + Hash + Clone,
 {
-    pub fn new(capacity: usize) -> Result<ArcCache<K, V>, &'static str> {
-        if capacity <= 0 {
-            return Err("Cache length cannot be zero");
-        }
-        let cache = ArcCache {
+    pub fn new(capacity: usize) -> ArcCache<K, V> {
+        assert_ne!(capacity, 0, "Cache length cannot be zero");
+        ArcCache {
             recent_set: LruCache::new(capacity),
             recent_evicted: LruCache::new(capacity),
             frequent_set: LruCache::new(capacity),
             frequent_evicted: LruCache::new(capacity),
-            capacity: capacity,
+            capacity,
             p: 0,
             inserted: 0,
             evicted: 0,
             removed: 0,
-        };
-        Ok(cache)
+        }
     }
 
     pub fn contains_key<Q: ?Sized>(&mut self, key: &Q) -> bool
@@ -47,19 +42,26 @@ where
         self.frequent_set.contains_key(key) || self.recent_set.contains_key(key)
     }
 
-    pub fn insert(&mut self, key: K, value: V) -> bool {
-        if self.frequent_set.contains_key(&key) {
-            self.frequent_set.insert(key, value);
-            return true;
+    pub fn insert<F>(&mut self, key: K, value: V, mut merge: F) -> (bool, Vec<(K, V)>)
+    where F: FnMut(&mut V, V),
+    {
+        if let Some(old) = self.frequent_set.get_mut(&key) {
+            merge(old, value);
+            return (true, vec![]);
         }
-        if self.recent_set.contains_key(&key) {
-            self.recent_set.remove(&key);
-            self.frequent_set.insert(key, value);
-            return true;
+
+        if let Some(mut old) = self.recent_set.remove(&key) {
+            merge(&mut old, value);
+            let (_, lru) = self.frequent_set.insert(key, old);
+            return (true, lru.into_iter().collect());
         }
-        if self.frequent_evicted.contains_key(&key) {
-            let recent_evicted_len = self.recent_evicted.len();
-            let frequent_evicted_len = self.frequent_evicted.len();
+
+        let recent_evicted_len = self.recent_evicted.len();
+        let frequent_evicted_len = self.frequent_evicted.len();
+        let recent_len = self.recent_set.len();
+        let frequent_len = self.frequent_set.len();
+
+        if self.frequent_evicted.remove(&key).is_some() {
             let delta = if recent_evicted_len > frequent_evicted_len {
                 recent_evicted_len / frequent_evicted_len
             } else {
@@ -68,18 +70,28 @@ where
             if delta < self.p {
                 self.p -= delta;
             } else {
-                self.p = 0
+                self.p = 0;
             }
-            if self.recent_set.len() + self.frequent_set.len() >= self.capacity {
-                self.replace(true);
+            let mut lrus = Vec::with_capacity(2);
+            if recent_len + frequent_len >= self.capacity {
+                if let Some(lru) = self.replace(true) {
+                    lrus.push(lru);
+                }
             }
-            self.frequent_evicted.remove(&key);
-            self.frequent_set.insert(key, value);
-            return true;
+
+            // TODO use the entry API instead
+            let value = match self.frequent_set.remove(&key) {
+                Some(mut old) => { merge(&mut old, value); old },
+                None => value,
+            };
+
+            if let (_, Some(lru)) = self.frequent_set.insert(key, value) {
+                lrus.push(lru);
+            }
+            return (true, lrus);
         }
-        if self.recent_evicted.contains_key(&key) {
-            let recent_evicted_len = self.recent_evicted.len();
-            let frequent_evicted_len = self.frequent_evicted.len();
+
+        if self.recent_evicted.remove(&key).is_some() {
             let delta = if frequent_evicted_len > recent_evicted_len {
                 frequent_evicted_len / recent_evicted_len
             } else {
@@ -90,27 +102,55 @@ where
             } else {
                 self.p = self.capacity;
             }
-            if self.recent_set.len() + self.frequent_set.len() >= self.capacity {
-                self.replace(false);
+            let mut lrus = Vec::with_capacity(2);
+            if recent_len + frequent_len >= self.capacity {
+                if let Some(lru) = self.replace(false) {
+                    lrus.push(lru);
+                }
             }
-            self.recent_evicted.remove(&key);
-            self.frequent_set.insert(key, value);
-            return true;
+
+            // TODO use the entry API instead
+            let value = match self.frequent_set.remove(&key) {
+                Some(mut old) => { merge(&mut old, value); old },
+                None => value,
+            };
+
+            if let (_, Some(lru)) = self.frequent_set.insert(key, value) {
+                lrus.push(lru);
+            }
+            return (true, lrus);
         }
-        if self.recent_set.len() + self.frequent_set.len() >= self.capacity {
-            self.replace(false);
+
+        let mut lrus = Vec::with_capacity(2);
+
+        if recent_len + frequent_len >= self.capacity {
+            if let Some(lru) = self.replace(false) {
+                lrus.push(lru);
+            }
         }
-        if self.recent_evicted.len() > self.capacity - self.p {
+
+        if recent_evicted_len > self.capacity - self.p {
             self.recent_evicted.remove_lru();
             self.evicted += 1;
         }
-        if self.frequent_evicted.len() > self.p {
+
+        if frequent_evicted_len > self.p {
             self.frequent_evicted.remove_lru();
             self.evicted += 1;
         }
-        self.recent_set.insert(key, value);
+
+        // TODO use the entry API instead
+        let value = match self.recent_set.remove(&key) {
+            Some(mut old) => { merge(&mut old, value); old },
+            None => value,
+        };
+
+        if let (_, Some(lru)) = self.recent_set.insert(key, value) {
+            lrus.push(lru);
+        }
         self.inserted += 1;
-        false
+
+        (false, lrus)
     }
 
     pub fn peek_mut(&mut self, key: &K) -> Option<&mut V>
@@ -150,20 +190,23 @@ where
         }
     }
 
-    fn replace(&mut self, frequent_evicted_contains_key: bool) {
+    fn replace(&mut self, frequent_evicted_contains_key: bool) -> Option<(K, V)> {
         let recent_set_len = self.recent_set.len();
         if recent_set_len > 0
             && (recent_set_len > self.p
                 || (recent_set_len == self.p && frequent_evicted_contains_key))
         {
-            if let Some((old_key, _)) = self.recent_set.remove_lru() {
-                self.recent_evicted.insert(old_key, ());
+            if let Some((old_key, old_value)) = self.recent_set.remove_lru() {
+                self.recent_evicted.insert(old_key.clone(), ());
+                return Some((old_key, old_value));
             }
         } else {
-            if let Some((old_key, _)) = self.frequent_set.remove_lru() {
-                self.frequent_evicted.insert(old_key, ());
+            if let Some((old_key, old_value)) = self.frequent_set.remove_lru() {
+                self.frequent_evicted.insert(old_key.clone(), ());
+                return Some((old_key, old_value));
             }
         }
+        None
     }
 
     pub fn len(&self) -> usize {
@@ -189,20 +232,77 @@ where
     pub fn removed(&self) -> u64 {
         self.removed
     }
+
+    pub fn iter(&self) -> iter::Chain<Iter<K, V>, Iter<K, V>> {
+        self.into_iter()
+    }
 }
 
-#[test]
-fn test_arc() {
-    let mut arc: ArcCache<&str, &str> = ArcCache::new(2).unwrap();
-    arc.insert("testkey", "testvalue");
-    assert!(arc.contains_key(&"testkey"));
-    arc.insert("testkey2", "testvalue2");
-    assert!(arc.contains_key(&"testkey2"));
-    arc.insert("testkey3", "testvalue3");
-    assert!(arc.contains_key(&"testkey3"));
-    assert!(arc.contains_key(&"testkey2"));
-    assert!(!arc.contains_key(&"testkey"));
-    arc.insert("testkey", "testvalue");
-    assert!(arc.get_mut(&"testkey").is_some());
-    assert!(arc.get_mut(&"testkey-nx").is_none());
+impl<K: Eq + Hash, V> IntoIterator for ArcCache<K, V> {
+    type Item = (K, V);
+    type IntoIter = iter::Chain<IntoIter<K, V>, IntoIter<K, V>>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        let recent = self.recent_set.into_iter();
+        let frequent = self.frequent_set.into_iter();
+        recent.chain(frequent)
+    }
+}
+
+impl<'a, K: Eq + Hash, V> IntoIterator for &'a ArcCache<K, V> {
+    type Item = (&'a K, &'a V);
+    type IntoIter = iter::Chain<Iter<'a, K, V>, Iter<'a, K, V>>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        let recent = self.recent_set.iter();
+        let frequent = self.frequent_set.iter();
+        recent.chain(frequent)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn replace_and_drop<T>(old: &mut T, new: T) {
+        let _ = std::mem::replace(old, new);
+    }
+
+    #[test]
+    fn easy() {
+        let mut arc = ArcCache::new(2);
+
+        arc.insert("testkey", "testvalue", replace_and_drop);
+        assert!(arc.contains_key(&"testkey"));
+
+        arc.insert("testkey2", "testvalue2", replace_and_drop);
+        assert!(arc.contains_key(&"testkey2"));
+
+        arc.insert("testkey3", "testvalue3", replace_and_drop);
+        assert!(arc.contains_key(&"testkey3"));
+        assert!(arc.contains_key(&"testkey2"));
+        assert!(!arc.contains_key(&"testkey"));
+
+        arc.insert("testkey", "testvalue", replace_and_drop);
+        assert!(arc.get_mut(&"testkey").is_some());
+        assert!(arc.get_mut(&"testkey-nx").is_none());
+    }
+
+    #[test]
+    fn poped_out() {
+        let mut arc = ArcCache::new(2);
+
+        let (_, _poped) = arc.insert("1", "a", replace_and_drop);
+        let (_, poped) = arc.insert("2", "b", replace_and_drop);
+        assert!(poped.is_empty());
+
+        let (_, poped) = arc.insert("3", "c", replace_and_drop);
+        assert_eq!(poped, vec![("1", "a")]);
+
+        let (_, poped) = arc.insert("2", "b", replace_and_drop);
+        assert!(poped.is_empty());
+
+        let (_, poped) = arc.insert("1", "a", replace_and_drop);
+        assert_eq!(poped, vec![("2", "b")]);
+    }
 }

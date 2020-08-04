@@ -10,7 +10,8 @@ categories = ["algorithms", "caching", "memory-management"]
 edition = "2018"
 
 [dependencies]
-xlru-cache = "0.1"
+# xlru-cache = "0.1"
+xlru-cache = { path = "../rust-xlru-cache" }
 
 [badges]
 travis-ci = { repository = "jedisct1/rust-arc-cache" }
